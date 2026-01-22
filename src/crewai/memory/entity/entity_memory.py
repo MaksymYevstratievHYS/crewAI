@@ -16,7 +16,16 @@ class EntityMemory(Memory):
         else:
             self.memory_provider = None
 
-        if self.memory_provider == "mem0":
+        if self.memory_provider == "local_mem0":
+            try:
+                from crewai.memory.storage.local_mem0_storage import LocalMem0Storage
+            except Exception:
+                raise ImportError(
+                    f"Error in {__class__.__name__} while importing: LocalMem0Storage. 'from crewai.memory.storage.local_mem0_storage import LocalMem0Storage'"
+                )
+            storage = LocalMem0Storage(type="entities", crew=crew)
+
+        elif self.memory_provider == "mem0":
             try:
                 from crewai.memory.storage.mem0_storage import Mem0Storage
             except ImportError:
@@ -38,18 +47,27 @@ class EntityMemory(Memory):
             )
         super().__init__(storage)
 
-    def save(self, item: EntityMemoryItem) -> None:  # type: ignore # BUG?: Signature of "save" incompatible with supertype "Memory"
-        """Saves an entity item into the SQLite storage."""
-        if self.memory_provider == "mem0":
-            data = f"""
-            Remember details about the following entity:
-            Name: {item.name}
-            Type: {item.type}
-            Entity Description: {item.description}
-            """
+    def save(self, batch_of_items: list[EntityMemoryItem]) -> None:  # type: ignore # BUG?: Signature of "save" incompatible with supertype "Memory"
+
+        if self.memory_provider == "local_mem0":
+            data = ""
+            for item in batch_of_items:
+                data += f"{item.name}({item.type}): {item.description}\n "
+            super().save(data, item.metadata)
+
+        elif self.memory_provider == "mem0":
+            for item in batch_of_items:
+                data = f"""
+                Remember details about the following entity:
+                Name: {item.name}
+                Type: {item.type}
+                Entity Description: {item.description}
+                """
+                super().save(data, item.metadata)
         else:
-            data = f"{item.name}({item.type}): {item.description}"
-        super().save(data, item.metadata)
+            for item in batch_of_items:
+                data = f"{item.name}({item.type}): {item.description}"
+                super().save(data, item.metadata)
 
     def reset(self) -> None:
         try:

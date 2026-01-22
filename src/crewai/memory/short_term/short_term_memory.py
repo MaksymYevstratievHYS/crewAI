@@ -20,7 +20,16 @@ class ShortTermMemory(Memory):
         else:
             self.memory_provider = None
 
-        if self.memory_provider == "mem0":
+        if self.memory_provider == "local_mem0":
+            try:
+                from crewai.memory.storage.local_mem0_storage import LocalMem0Storage
+            except Exception:
+                raise ImportError(
+                    f"Error in {__class__.__name__} while importing: LocalMem0Storage. 'from crewai.memory.storage.local_mem0_storage import LocalMem0Storage'"
+                )
+            storage = LocalMem0Storage(type="short_term", crew=crew)
+
+        elif self.memory_provider == "mem0":
             try:
                 from crewai.memory.storage.mem0_storage import Mem0Storage
             except ImportError:
@@ -57,7 +66,7 @@ class ShortTermMemory(Memory):
         self,
         query: str,
         limit: int = 3,
-        score_threshold: float = 0.35,
+        score_threshold: float = 0.45,
     ):
         return self.storage.search(
             query=query, limit=limit, score_threshold=score_threshold

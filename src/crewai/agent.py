@@ -6,12 +6,18 @@ from pydantic import Field, InstanceOf, PrivateAttr, model_validator
 
 from crewai.agents import CacheHandler
 from crewai.agents.agent_builder.base_agent import BaseAgent
-from crewai.agents.crew_agent_executor import CrewAgentExecutor
-from crewai.knowledge.knowledge import Knowledge
-from crewai.knowledge.source.base_knowledge_source import BaseKnowledgeSource
-from crewai.knowledge.utils.knowledge_utils import extract_knowledge_context
+from crewai.agents.crew_agent_executor import (
+    CrewAgentExecutor,
+    KNOWLEDGE_KEYWORD,
+    END_OF_KNOWLEDGE_KEYWORD,
+    EMPTY_KNOWLEDGE_KEYWORD,
+    EMPTY_KNOWLEDGE_KEYWORD,
+)
 from crewai.llm import LLM
 from crewai.memory.contextual.contextual_memory import ContextualMemory
+from crewai.memory.contextual.user_input_contextual_memory import (
+    UserInputContextualMemory,
+)
 from crewai.task import Task
 from crewai.tools import BaseTool
 from crewai.tools.agent_tools.agent_tools import AgentTools
@@ -23,7 +29,15 @@ from crewai.utilities.llm_utils import create_llm
 from crewai.utilities.token_counter_callback import TokenCalcHandler
 from crewai.utilities.training_handler import CrewTrainingHandler
 
+from crewai.prompts.knowledge_query_generation_prompt import (
+    KNOWLEDGE_QUERY_GENERATION_PROMPT,
+)
+from textwrap import dedent
+from contextlib import contextmanager
+
 agentops = None
+
+from loguru import logger
 
 try:
     import agentops  # type: ignore # Name "agentops" is already defined
@@ -35,6 +49,17 @@ except ImportError:
             return f
 
         return noop
+
+
+@contextmanager
+def temporary_temperature(llm: LLM, temp: float):
+    """Temporarily set LLM temperature for knowledge query generation, restoring original value after."""
+    original = llm.temperature
+    llm.temperature = temp
+    try:
+        yield
+    finally:
+        llm.temperature = original
 
 
 @track_agent()
@@ -49,7 +74,6 @@ class Agent(BaseAgent):
             role: The role of the agent.
             goal: The objective of the agent.
             backstory: The backstory of the agent.
-            knowledge: The knowledge base of the agent.
             config: Dict representation of agent configuration.
             llm: The language model that will run the agent.
             function_calling_llm: The language model that will handle the tool calling for this agent, it overrides the crew function_calling_llm.
@@ -60,7 +84,11 @@ class Agent(BaseAgent):
             allow_delegation: Whether the agent is allowed to delegate tasks to other agents.
             tools: Tools at agents disposal
             step_callback: Callback to be executed after each step of the agent execution.
-            knowledge_sources: Knowledge sources for the agent.
+
+            knowledge_collection_id: A unique identifier of the knowledgecollection instance for agent. Now fields "knowledge_sources" and "knowledge" are unnecessary.
+            rag_type_id: RAG type and ID in format 'rag_type:id' (e.g., 'naive:6', 'graph:10').
+            rag_search_config: RAG-specific search configuration parameters as dict (e.g., {'search_limit': 3, 'similarity_threshold': 0.2}).
+
     """
 
     _times_executed: int = PrivateAttr(default=0)
@@ -122,21 +150,25 @@ class Agent(BaseAgent):
         default="safe",
         description="Mode for code execution: 'safe' (using Docker) or 'unsafe' (direct execution).",
     )
-    embedder_config: Optional[Dict[str, Any]] = Field(
+    embedder: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Embedder configuration for the agent.",
     )
-    knowledge_sources: Optional[List[BaseKnowledgeSource]] = Field(
+    ask_human_input_callback: Optional[Any] = Field(
         default=None,
-        description="Knowledge sources for the agent.",
+        description="Callback to be executed after Agent action if user_input is true",
     )
-    _knowledge: Optional[Knowledge] = PrivateAttr(
+    search_knowledges: Optional[Any] = Field(
         default=None,
+        description="KnowledgeSearchService method for searching in knowledge module with redis pub/sub",
+    )
+    user_input_contextual_memory: Optional[Any] = Field(
+        default=None,
+        description="user_input_contextual_memory",
     )
 
     @model_validator(mode="after")
     def post_init_setup(self):
-        self._set_knowledge()
         self.agent_ops_agent_name = self.role
 
         self.llm = create_llm(self.llm)
@@ -156,20 +188,9 @@ class Agent(BaseAgent):
             self.cache_handler = CacheHandler()
         self.set_cache_handler(self.cache_handler)
 
-    def _set_knowledge(self):
-        try:
-            if self.knowledge_sources:
-                knowledge_agent_name = f"{self.role.replace(' ', '_')}"
-                if isinstance(self.knowledge_sources, list) and all(
-                    isinstance(k, BaseKnowledgeSource) for k in self.knowledge_sources
-                ):
-                    self._knowledge = Knowledge(
-                        sources=self.knowledge_sources,
-                        embedder_config=self.embedder_config,
-                        collection_name=knowledge_agent_name,
-                    )
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"Invalid Knowledge Configuration: {str(e)}")
+    def _extract_knowledges(self, knowledge_snippets: list) -> str:
+        snippet = "\n_______\n".join(knowledge_snippets)
+        return snippet
 
     def execute_task(
         self,
@@ -208,11 +229,6 @@ class Agent(BaseAgent):
                 output_format=schema
             )
 
-        if context:
-            task_prompt = self.i18n.slice("task_with_context").format(
-                task=task_prompt, context=context
-            )
-
         if self.crew and self.crew.memory:
             contextual_memory = ContextualMemory(
                 self.crew.memory_config,
@@ -224,22 +240,39 @@ class Agent(BaseAgent):
             memory = contextual_memory.build_context_for_task(task, context)
             if memory.strip() != "":
                 task_prompt += self.i18n.slice("memory").format(memory=memory)
+            self.user_input_contextual_memory = UserInputContextualMemory(
+                memory_config=self.crew.memory_config, um=self.crew._user_memory
+            )
 
-        if self._knowledge:
-            agent_knowledge_snippets = self._knowledge.query([task.prompt()])
-            if agent_knowledge_snippets:
-                agent_knowledge_context = extract_knowledge_context(
-                    agent_knowledge_snippets
-                )
-                if agent_knowledge_context:
-                    task_prompt += agent_knowledge_context
+        if context:
+            task_prompt = self.i18n.slice("task_with_context").format(
+                task=task_prompt, context=context
+            )
 
-        if self.crew:
-            knowledge_snippets = self.crew.query_knowledge([task.prompt()])
-            if knowledge_snippets:
-                crew_knowledge_context = extract_knowledge_context(knowledge_snippets)
-                if crew_knowledge_context:
-                    task_prompt += crew_knowledge_context
+        agent_knowledge_snippet = ""
+
+        if self.rag_type_id:
+            source = f"Agent {self.role}'s"
+            knowledge_query = self._get_knowledge_query(task, context, source=source)
+            agent_knowledges = self.search_knowledges(
+                sender="ag",
+                knowledge_collection_id=self.knowledge_collection_id,
+                rag_type_id=self.rag_type_id,
+                rag_search_config=self.rag_search_config,
+                query=knowledge_query,
+            )
+            agent_knowledge_snippet = self._extract_knowledges(agent_knowledges)
+            task_prompt += (
+                f"{KNOWLEDGE_KEYWORD} \n\n{agent_knowledge_snippet}"
+                if agent_knowledge_snippet
+                else ""
+            )
+
+        if agent_knowledge_snippet:
+            task_prompt += f"\n{END_OF_KNOWLEDGE_KEYWORD}"
+
+        if not agent_knowledge_snippet:
+            task_prompt += f"\n{EMPTY_KNOWLEDGE_KEYWORD}\n"
 
         tools = tools or self.tools or []
         self.create_agent_executor(tools=tools, task=task)
@@ -327,6 +360,8 @@ class Agent(BaseAgent):
                 self._rpm_controller.check_or_wait if self._rpm_controller else None
             ),
             callbacks=[TokenCalcHandler(self._token_process)],
+            ask_human_input_callback=self.ask_human_input_callback,
+            user_input_contextual_memory=self.user_input_contextual_memory,
         )
 
     def get_delegation_tools(self, agents: List[BaseAgent]):
@@ -388,6 +423,64 @@ class Agent(BaseAgent):
                 )
 
         return task_prompt
+
+    def _get_knowledge_query(
+        self, task: Task, context: Optional[str], source: str
+    ) -> str:
+        """Return a knowledge query, using task.knowledge_query if available, else generate one."""
+        if task.knowledge_query:
+            query = task.knowledge_query
+            logger.info(f"{source} knowledge query: {query}")
+        else:
+            query = self._generate_knowledge_query(
+                task=task, previous_tasks_context=context
+            )
+            logger.info(f"{source} knowledge query (autogenerated): {query}")
+        return query
+
+    def _generate_knowledge_query(
+        self, task: Task, previous_tasks_context: str | None
+    ) -> str:
+        """
+        Generate a concise knowledge query for a task, optionally enhanced
+        by previous tasks context. Uses agent metadata to refine phrasing.
+
+        Args:
+            task (Task): Task with 'description' and 'expected_output'.
+            previous_tasks_context (str | None): Optional context to enhance the query.
+
+        Returns:
+            str: Knowledge query ready for embedding.
+        """
+
+        if previous_tasks_context:
+            previous_context_block = (
+                f"- **Previous task context:** {previous_tasks_context}"
+            )
+            previous_context_guidelines = dedent(
+                """
+                - **Previous task context (if provided)** → Use this only as a **secondary enhancer**:  
+                    * Integrate details that logically extend, refine, or clarify the current task.  
+                    * Ignore any unrelated or redundant parts completely.
+            """
+            )
+        else:
+            previous_context_block = ""
+            previous_context_guidelines = ""
+
+        prompt = KNOWLEDGE_QUERY_GENERATION_PROMPT.format(
+            role=self.role,
+            goal=self.goal,
+            backstory=self.backstory,
+            description=task.description,
+            expected_output=task.expected_output,
+            previous_context_block=previous_context_block,
+            previous_context_guidelines=previous_context_guidelines,
+        )
+
+        with temporary_temperature(self.llm, temp=0.0):
+            knowledge_query = self.llm.call(prompt)
+        return knowledge_query
 
     def _use_trained_data(self, task_prompt: str) -> str:
         """Use trained data for the agent task prompt to improve output."""

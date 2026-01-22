@@ -2,7 +2,7 @@ import subprocess
 
 import click
 
-from crewai.knowledge.storage.knowledge_storage import KnowledgeStorage
+# from crewai.knowledge.storage.knowledge_storage import KnowledgeStorage
 from crewai.memory.entity.entity_memory import EntityMemory
 from crewai.memory.long_term.long_term_memory import LongTermMemory
 from crewai.memory.short_term.short_term_memory import ShortTermMemory
@@ -35,7 +35,7 @@ def reset_memories_command(
             EntityMemory().reset()
             LongTermMemory().reset()
             TaskOutputStorageHandler().reset()
-            KnowledgeStorage().reset()
+            # KnowledgeStorage().reset()
             click.echo("All memories have been reset.")
         else:
             if long:
@@ -51,9 +51,9 @@ def reset_memories_command(
             if kickoff_outputs:
                 TaskOutputStorageHandler().reset()
                 click.echo("Latest Kickoff outputs stored has been reset.")
-            if knowledge:
-                KnowledgeStorage().reset()
-                click.echo("Knowledge has been reset.")
+            # if knowledge:
+            #     KnowledgeStorage().reset()
+            #     click.echo("Knowledge has been reset.")
 
     except subprocess.CalledProcessError as e:
         click.echo(f"An error occurred while resetting the memories: {e}", err=True)

@@ -35,8 +35,9 @@ class ContextualMemory:
         context.append(self._fetch_ltm_context(task.description))
         context.append(self._fetch_stm_context(query))
         context.append(self._fetch_entity_context(query))
-        if self.memory_provider == "mem0":
-            context.append(self._fetch_user_context(query))
+        context.append(
+            self._fetch_user_context(query=query, limit=8, score_threshold=0.75)
+        )
         return "\n".join(filter(None, context))
 
     def _fetch_stm_context(self, query) -> str:
@@ -47,11 +48,15 @@ class ContextualMemory:
         stm_results = self.stm.search(query)
         formatted_results = "\n".join(
             [
-                f"- {result['memory'] if self.memory_provider == 'mem0' else result['context']}"
+                f"- {result['memory'] if self.memory_provider == 'mem0' or self.memory_provider == 'local_mem0' else result['context']}"
                 for result in stm_results
             ]
         )
-        return f"Recent Insights:\n{formatted_results}" if stm_results else ""
+        return (
+            f"Short-term memories. Recent Insights:\n{formatted_results}"
+            if stm_results
+            else ""
+        )
 
     def _fetch_ltm_context(self, task) -> Optional[str]:
         """
@@ -70,7 +75,11 @@ class ContextualMemory:
         formatted_results = list(dict.fromkeys(formatted_results))
         formatted_results = "\n".join([f"- {result}" for result in formatted_results])  # type: ignore # Incompatible types in assignment (expression has type "str", variable has type "list[str]")
 
-        return f"Historical Data:\n{formatted_results}" if ltm_results else ""
+        return (
+            f"Long-term memories. Historical Data:\n{formatted_results}"
+            if ltm_results
+            else ""
+        )
 
     def _fetch_entity_context(self, query) -> str:
         """
@@ -80,13 +89,15 @@ class ContextualMemory:
         em_results = self.em.search(query)
         formatted_results = "\n".join(
             [
-                f"- {result['memory'] if self.memory_provider == 'mem0' else result['context']}"
+                f"- {result['memory'] if self.memory_provider == 'mem0' or  self.memory_provider == 'local_mem0' else result['context']}"
                 for result in em_results
             ]  # type: ignore #  Invalid index type "str" for "str"; expected type "SupportsIndex | slice"
         )
-        return f"Entities:\n{formatted_results}" if em_results else ""
+        return f"Entity memories:\n{formatted_results}" if em_results else ""
 
-    def _fetch_user_context(self, query: str) -> str:
+    def _fetch_user_context(
+        self, query: str, limit: int, score_threshold: float
+    ) -> str:
         """
         Fetches and formats relevant user information from User Memory.
         Args:
@@ -94,11 +105,13 @@ class ContextualMemory:
         Returns:
             str: Formatted user memories as bullet points, or an empty string if none found.
         """
-        user_memories = self.um.search(query)
+        user_memories = self.um.search(
+            query=query, limit=limit, score_threshold=score_threshold
+        )
         if not user_memories:
             return ""
 
         formatted_memories = "\n".join(
             f"- {result['memory']}" for result in user_memories
         )
-        return f"User memories/preferences:\n{formatted_memories}"
+        return f"User memories take priority over all other memory types. If any conflicting or unclear information appears, always trust and follow the details from user memories/preferences as the most accurate source. User memories/preferences:\n{formatted_memories}"

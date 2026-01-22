@@ -48,6 +48,9 @@ class BaseAgent(ABC, BaseModel):
         cache_handler (InstanceOf[CacheHandler]): An instance of the CacheHandler class.
         tools_handler (InstanceOf[ToolsHandler]): An instance of the ToolsHandler class.
         max_tokens: Maximum number of tokens for the agent to generate in a response.
+        knowledge_collection_id: A unique identifier of the knowledgecollection instance for agent.
+        rag_type_id: RAG type and ID in format 'rag_type:id' (e.g., 'naive:6', 'graph:10').
+        rag_search_config: RAG-specific search configuration parameters as dict (e.g., {'search_limit': 3, 'similarity_threshold': 0.2}).
 
 
     Methods:
@@ -129,6 +132,18 @@ class BaseAgent(ABC, BaseModel):
     )
     max_tokens: Optional[int] = Field(
         default=None, description="Maximum number of tokens for the agent's execution."
+    )
+    knowledge_collection_id: Optional[int] = Field(
+        default=None,
+        description="Knowledge collection id for the agent",
+    )
+    rag_type_id: Optional[str] = Field(
+        default=None,
+        description="RAG type and ID in format 'rag_type:id' (e.g., 'naive:6', 'graph:10')",
+    )
+    rag_search_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="RAG-specific search configuration parameters (e.g., {'rag_type': 'naive', 'search_limit': 3, 'similarity_threshold': 0.2})",
     )
 
     @model_validator(mode="before")
@@ -258,11 +273,16 @@ class BaseAgent(ABC, BaseModel):
             "llm",
         }
 
-        # Copy llm and clear callbacks
+        # Copy llm
         existing_llm = shallow_copy(self.llm)
+
         copied_data = self.model_dump(exclude=exclude)
         copied_data = {k: v for k, v in copied_data.items() if v is not None}
-        copied_agent = type(self)(**copied_data, llm=existing_llm, tools=self.tools)
+        copied_agent = type(self)(
+            **copied_data,
+            llm=existing_llm,
+            tools=self.tools,
+        )
 
         return copied_agent
 

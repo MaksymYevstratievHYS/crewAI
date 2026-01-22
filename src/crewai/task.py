@@ -56,6 +56,7 @@ class Task(BaseModel):
         config: Dictionary containing task-specific configuration parameters.
         context: List of Task instances providing task context or input data.
         description: Descriptive text detailing task's purpose and execution.
+        knowledge_query: Text that will be passed to knowledge container as query parameter 
         expected_output: Clear definition of expected task outcome.
         output_file: File path for storing task output.
         output_json: Pydantic model for structuring JSON output.
@@ -72,6 +73,7 @@ class Task(BaseModel):
     name: Optional[str] = Field(default=None)
     prompt_context: Optional[str] = None
     description: str = Field(description="Description of the actual task.")
+    knowledge_query: Optional[str] = Field(description="Knowledge query of the actual task.", default=None)
     expected_output: str = Field(
         description="Clear definition of expected output for the task."
     )
@@ -186,6 +188,7 @@ class Task(BaseModel):
     _telemetry: Telemetry = PrivateAttr(default_factory=Telemetry)
     _execution_span: Optional[Span] = PrivateAttr(default=None)
     _original_description: Optional[str] = PrivateAttr(default=None)
+    _original_knowledge_query: Optional[str] = PrivateAttr(default=None)
     _original_expected_output: Optional[str] = PrivateAttr(default=None)
     _original_output_file: Optional[str] = PrivateAttr(default=None)
     _thread: Optional[threading.Thread] = PrivateAttr(default=None)
@@ -304,8 +307,9 @@ class Task(BaseModel):
     @property
     def key(self) -> str:
         description = self._original_description or self.description
+        knowledge_query = self._original_knowledge_query or self.knowledge_query
         expected_output = self._original_expected_output or self.expected_output
-        source = [description, expected_output]
+        source = [description, knowledge_query, expected_output]
 
         return md5("|".join(source).encode(), usedforsecurity=False).hexdigest()
 
@@ -373,6 +377,7 @@ class Task(BaseModel):
         task_output = TaskOutput(
             name=self.name,
             description=self.description,
+            knowledge_query=self.knowledge_query,
             expected_output=self.expected_output,
             raw=result,
             pydantic=pydantic_output,
@@ -431,7 +436,9 @@ class Task(BaseModel):
             content = (
                 json_output
                 if json_output
-                else pydantic_output.model_dump_json() if pydantic_output else result
+                else pydantic_output.model_dump_json()
+                if pydantic_output
+                else result
             )
             self._save_file(content)
 
@@ -452,9 +459,9 @@ class Task(BaseModel):
         return "\n".join(tasks_slices)
 
     def interpolate_inputs_and_add_conversation_history(
-        self, inputs: Dict[str, Union[str, int, float]]
+        self, inputs: Dict[str, Union[str, int, float, Dict[str, Any], List[Any]]]
     ) -> None:
-        """Interpolate inputs into the task description, expected output, and output file path.
+        """Interpolate inputs into the task description, knowledge_query (custom param), expected output, and output file path.
            Add conversation history if present.
 
         Args:
@@ -466,6 +473,8 @@ class Task(BaseModel):
         """
         if self._original_description is None:
             self._original_description = self.description
+        if self._original_knowledge_query is None:
+            self._original_knowledge_query = self.knowledge_query
         if self._original_expected_output is None:
             self._original_expected_output = self.expected_output
         if self.output_file is not None and self._original_output_file is None:
@@ -482,6 +491,18 @@ class Task(BaseModel):
             ) from e
         except ValueError as e:
             raise ValueError(f"Error interpolating description: {str(e)}") from e
+        
+        try:
+            if self._original_knowledge_query is not None:
+                self.knowledge_query = self._original_knowledge_query.format(**inputs)
+            else:
+                self.knowledge_query = None
+        except KeyError as e:
+            raise ValueError(
+                f"Missing required template variable '{e.args[0]}' in knowledge_query"
+            ) from e
+        except ValueError as e:
+            raise ValueError(f"Error interpolating knowledge_query: {str(e)}") from e
 
         try:
             self.expected_output = self.interpolate_only(
@@ -524,7 +545,9 @@ class Task(BaseModel):
             )
 
     def interpolate_only(
-        self, input_string: Optional[str], inputs: Dict[str, Union[str, int, float]]
+        self,
+        input_string: Optional[str],
+        inputs: Dict[str, Union[str, int, float, Dict[str, Any], List[Any]]],
     ) -> str:
         """Interpolate placeholders (e.g., {key}) in a string while leaving JSON untouched.
 
@@ -532,17 +555,39 @@ class Task(BaseModel):
             input_string: The string containing template variables to interpolate.
                          Can be None or empty, in which case an empty string is returned.
             inputs: Dictionary mapping template variables to their values.
-                   Supported value types are strings, integers, and floats.
-                   If input_string is empty or has no placeholders, inputs can be empty.
+                   Supported value types are strings, integers, floats, and dicts/lists
+                   containing only these types and other nested dicts/lists.
 
         Returns:
             The interpolated string with all template variables replaced with their values.
             Empty string if input_string is None or empty.
 
         Raises:
-            ValueError: If a required template variable is missing from inputs.
-            KeyError: If a template variable is not found in the inputs dictionary.
+            ValueError: If a value contains unsupported types
         """
+
+        # Validation function for recursive type checking
+        def validate_type(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (str, int, float, bool)):
+                return
+            if isinstance(value, (dict, list)):
+                for item in value.values() if isinstance(value, dict) else value:
+                    validate_type(item)
+                return
+            raise ValueError(
+                f"Unsupported type {type(value).__name__} in inputs. "
+                "Only str, int, float, bool, dict, and list are allowed."
+            )
+
+        # Validate all input values
+        for key, value in inputs.items():
+            try:
+                validate_type(value)
+            except ValueError as e:
+                raise ValueError(f"Invalid value for key '{key}': {str(e)}") from e
+
         if input_string is None or not input_string:
             return ""
         if "{" not in input_string and "}" not in input_string:
@@ -551,15 +596,7 @@ class Task(BaseModel):
             raise ValueError(
                 "Inputs dictionary cannot be empty when interpolating variables"
             )
-
         try:
-            # Validate input types
-            for key, value in inputs.items():
-                if not isinstance(value, (str, int, float)):
-                    raise ValueError(
-                        f"Value for key '{key}' must be a string, integer, or float, got {type(value).__name__}"
-                    )
-
             escaped_string = input_string.replace("{", "{{").replace("}", "}}")
 
             for key in inputs.keys():
@@ -684,4 +721,4 @@ class Task(BaseModel):
         return None
 
     def __repr__(self):
-        return f"Task(description={self.description}, expected_output={self.expected_output})"
+        return f"Task(description={self.description}, expected_output={self.expected_output}, knowledge_query={self.knowledge_query})"

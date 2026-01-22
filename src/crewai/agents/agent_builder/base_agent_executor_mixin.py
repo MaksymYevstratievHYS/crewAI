@@ -1,5 +1,5 @@
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from crewai.memory.entity.entity_memory_item import EntityMemoryItem
 from crewai.memory.long_term.long_term_memory_item import LongTermMemoryItem
@@ -20,6 +20,8 @@ class CrewAgentExecutorMixin:
     task: Optional["Task"]
     iterations: int
     max_iter: int
+    ask_human_input_callback: Any = None
+
     _i18n: I18N
     _printer: Printer = Printer()
 
@@ -77,6 +79,7 @@ class CrewAgentExecutorMixin:
                 )
                 self.crew._long_term_memory.save(long_term_memory)
 
+                batch_of_entities = []
                 for entity in evaluation.entities:
                     entity_memory = EntityMemoryItem(
                         name=entity.name,
@@ -86,7 +89,10 @@ class CrewAgentExecutorMixin:
                             [f"- {r}" for r in entity.relationships]
                         ),
                     )
-                    self.crew._entity_memory.save(entity_memory)
+                    batch_of_entities.append(entity_memory)
+
+                if batch_of_entities:
+                    self.crew._entity_memory.save(batch_of_entities)
             except AttributeError as e:
                 print(f"Missing attributes for long term memory: {e}")
                 pass
@@ -94,19 +100,40 @@ class CrewAgentExecutorMixin:
                 print(f"Failed to add to long term memory: {e}")
                 pass
 
+    def _create_user_memory(self, user_input: str) -> None:
+        if self.crew and self.crew.memory and self.crew._user_memory:
+            try:
+                if hasattr(self.crew, "_user_memory") and self.crew._user_memory:
+                    self.crew._user_memory.save(value=user_input)
+            except Exception as e:
+                print(f"Failed to add to user memory: {e}")
+                pass
+
     def _ask_human_input(self, final_answer: str) -> str:
-        """Prompt human input for final decision making."""
+        """Prompt human input with mode-appropriate messaging."""
         self._printer.print(
             content=f"\033[1m\033[95m ## Final Result:\033[00m \033[92m{final_answer}\033[00m"
         )
 
-        self._printer.print(
-            content=(
+        # Training mode prompt (single iteration)
+        if self.crew and getattr(self.crew, "_train", False):
+            prompt = (
                 "\n\n=====\n"
-                "## Please provide feedback on the Final Result and the Agent's actions. "
-                "Respond with 'looks good' or a similar phrase when you're satisfied.\n"
+                "## TRAINING MODE: Provide feedback to improve the agent's performance.\n"
+                "This will be used to train better versions of the agent.\n"
+                "Please provide detailed feedback about the result quality and reasoning process.\n"
                 "=====\n"
-            ),
-            color="bold_yellow",
-        )
-        return input()
+            )
+        # Regular human-in-the-loop prompt (multiple iterations)
+        else:
+            prompt = (
+                "\n\n=====\n"
+                "## HUMAN FEEDBACK: Provide feedback on the Final Result and Agent's actions.\n"
+                "Respond with 'looks good' to accept or provide specific improvement requests.\n"
+                "You can provide multiple rounds of feedback until satisfied.\n"
+                "=====\n"
+            )
+
+        self._printer.print(content=prompt, color="bold_yellow")
+
+        return self.ask_human_input_callback()

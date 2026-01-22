@@ -6,10 +6,8 @@ from difflib import SequenceMatcher
 from json import JSONDecodeError
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Union
-
-import json5
 from json_repair import repair_json
-
+import json5
 import crewai.utilities.events as events
 from crewai.agents.tools_handler import ToolsHandler
 from crewai.task import Task

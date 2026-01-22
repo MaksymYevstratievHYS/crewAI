@@ -11,14 +11,32 @@ class UserMemory(Memory):
     MemoryItem instances.
     """
 
-    def __init__(self, crew=None):
-        try:
-            from crewai.memory.storage.mem0_storage import Mem0Storage
-        except ImportError:
-            raise ImportError(
-                "Mem0 is not installed. Please install it with `pip install mem0ai`."
+    def __init__(self, crew=None, embedder_config=None):
+        self.memory_provider = crew.memory_config.get("provider")
+
+        if self.memory_provider == "local_mem0":
+            try:
+                from crewai.memory.storage.local_mem0_storage import LocalMem0Storage
+            except Exception:
+                raise ImportError(
+                    f"Error in {__class__.__name__} while importing: LocalMem0Storage. 'from crewai.memory.storage.local_mem0_storage import LocalMem0Storage'"
+                )
+            storage = LocalMem0Storage(type="user", crew=crew)
+
+        elif self.memory_provider == "mem0":
+            try:
+                from crewai.memory.storage.mem0_storage import Mem0Storage
+            except ImportError:
+                raise ImportError(
+                    "Mem0 is not installed. Please install it with `pip install mem0ai`."
+                )
+            storage = Mem0Storage(type="user", crew=crew)
+
+        else:
+            raise AttributeError(
+                "UserMemory available only for memory provider: `local_mem0` or `mem0`"
             )
-        storage = Mem0Storage(type="user", crew=crew)
+
         super().__init__(storage)
 
     def save(
@@ -27,7 +45,6 @@ class UserMemory(Memory):
         metadata: Optional[Dict[str, Any]] = None,
         agent: Optional[str] = None,
     ) -> None:
-        # TODO: Change this function since we want to take care of the case where we save memories for the usr
         data = f"Remember the details about the user: {value}"
         super().save(data, metadata)
 

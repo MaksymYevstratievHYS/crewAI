@@ -54,18 +54,3 @@ class Printer:
 
     def _print_bold_yellow(self, content):
         print("\033[1m\033[93m {}\033[00m".format(content))
-
-    def _print_cyan(self, content):
-        print("\033[96m {}\033[00m".format(content))
-
-    def _print_bold_cyan(self, content):
-        print("\033[1m\033[96m {}\033[00m".format(content))
-
-    def _print_magenta(self, content):
-        print("\033[35m {}\033[00m".format(content))
-
-    def _print_bold_magenta(self, content):
-        print("\033[1m\033[35m {}\033[00m".format(content))
-
-    def _print_green(self, content):
-        print("\033[32m {}\033[00m".format(content))

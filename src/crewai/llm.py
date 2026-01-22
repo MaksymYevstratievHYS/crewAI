@@ -1,11 +1,13 @@
+import io
 import json
 import logging
 import os
 import sys
 import threading
+import time
 import warnings
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, TextIO, Union, cast
 
 from dotenv import load_dotenv
 
@@ -23,41 +25,98 @@ from crewai.utilities.exceptions.context_window_exceeding_exception import (
 load_dotenv()
 
 
-class FilteredStream:
-    def __init__(self, original_stream):
+class FilteredStream(io.TextIOBase):
+    _lock = None
+
+    def __init__(self, original_stream: TextIO):
         self._original_stream = original_stream
         self._lock = threading.Lock()
 
-    def write(self, s) -> int:
+    def write(self, s: str) -> int:
+        if not self._lock:
+            self._lock = threading.Lock()
+
         with self._lock:
-            # Filter out extraneous messages from LiteLLM
+            lower_s = s.lower()
+
+            # Skip common noisy LiteLLM banners and any other lines that contain "litellm"
             if (
-                "Give Feedback / Get Help: https://github.com/BerriAI/litellm/issues/new"
-                in s
-                or "LiteLLM.Info: If you need to debug this error, use `litellm.set_verbose=True`"
-                in s
+                "give feedback / get help" in lower_s
+                or "litellm.info:" in lower_s
+                or "litellm" in lower_s
+                or "Consider using a smaller input or implementing a text splitting strategy" in lower_s
             ):
                 return 0
+
             return self._original_stream.write(s)
 
     def flush(self):
         with self._lock:
             return self._original_stream.flush()
 
+    def __getattr__(self, name):
+        """Delegate attribute access to the wrapped original stream.
+
+        This ensures compatibility with libraries (e.g., Rich) that rely on
+        attributes such as `encoding`, `isatty`, `buffer`, etc., which may not
+        be explicitly defined on this proxy class.
+        """
+        return getattr(self._original_stream, name)
+
+    # Delegate common properties/methods explicitly so they aren't shadowed by
+    # the TextIOBase defaults (e.g., .encoding returns None by default, which
+    # confuses Rich). These explicit pass-throughs ensure the wrapped Console
+    # still sees a fully-featured stream.
+    @property
+    def encoding(self):
+        return getattr(self._original_stream, "encoding", "utf-8")
+
+    def isatty(self):
+        return self._original_stream.isatty()
+
+    def fileno(self):
+        return self._original_stream.fileno()
+
+    def writable(self):
+        return True
+
+
+# Apply the filtered stream globally so that any subsequent writes containing the filtered
+# keywords (e.g., "litellm") are hidden from terminal output. We guard against double
+# wrapping to ensure idempotency in environments where this module might be reloaded.
+if not isinstance(sys.stdout, FilteredStream):
+    sys.stdout = FilteredStream(sys.stdout)
+if not isinstance(sys.stderr, FilteredStream):
+    sys.stderr = FilteredStream(sys.stderr)
+
 
 LLM_CONTEXT_WINDOW_SIZES = {
     # openai
     "gpt-4": 8192,
     "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
+    "gpt-4o-mini": 200000,
     "gpt-4-turbo": 128000,
+    "gpt-4.1": 1047576,  # Based on official docs
+    "gpt-4.1-mini-2025-04-14": 1047576,
+    "gpt-4.1-nano-2025-04-14": 1047576,
     "o1-preview": 128000,
     "o1-mini": 128000,
+    "o3-mini": 200000,
+    "o4-mini": 200000,
     # gemini
     "gemini-2.0-flash": 1048576,
+    "gemini-2.0-flash-thinking-exp-01-21": 32768,
+    "gemini-2.0-flash-lite-001": 1048576,
+    "gemini-2.0-flash-001": 1048576,
+    "gemini-2.5-flash-preview-04-17": 1048576,
+    "gemini-2.5-pro-exp-03-25": 1048576,
     "gemini-1.5-pro": 2097152,
     "gemini-1.5-flash": 1048576,
     "gemini-1.5-flash-8b": 1048576,
+    "gemini/gemma-3-1b-it": 32000,
+    "gemini/gemma-3-4b-it": 128000,
+    "gemini/gemma-3-12b-it": 128000,
+    "gemini/gemma-3-27b-it": 128000,
     # deepseek
     "deepseek-chat": 128000,
     # groq
@@ -88,10 +147,77 @@ LLM_CONTEXT_WINDOW_SIZES = {
     "Llama-3.2-11B-Vision-Instruct": 16384,
     "Meta-Llama-3.2-3B-Instruct": 4096,
     "Meta-Llama-3.2-1B-Instruct": 16384,
+    # bedrock
+    "us.amazon.nova-pro-v1:0": 300000,
+    "us.amazon.nova-micro-v1:0": 128000,
+    "us.amazon.nova-lite-v1:0": 300000,
+    "us.anthropic.claude-3-5-sonnet-20240620-v1:0": 200000,
+    "us.anthropic.claude-3-5-haiku-20241022-v1:0": 200000,
+    "us.anthropic.claude-3-5-sonnet-20241022-v2:0": 200000,
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0": 200000,
+    "us.anthropic.claude-3-sonnet-20240229-v1:0": 200000,
+    "us.anthropic.claude-3-opus-20240229-v1:0": 200000,
+    "us.anthropic.claude-3-haiku-20240307-v1:0": 200000,
+    "us.meta.llama3-2-11b-instruct-v1:0": 128000,
+    "us.meta.llama3-2-3b-instruct-v1:0": 131000,
+    "us.meta.llama3-2-90b-instruct-v1:0": 128000,
+    "us.meta.llama3-2-1b-instruct-v1:0": 131000,
+    "us.meta.llama3-1-8b-instruct-v1:0": 128000,
+    "us.meta.llama3-1-70b-instruct-v1:0": 128000,
+    "us.meta.llama3-3-70b-instruct-v1:0": 128000,
+    "us.meta.llama3-1-405b-instruct-v1:0": 128000,
+    "eu.anthropic.claude-3-5-sonnet-20240620-v1:0": 200000,
+    "eu.anthropic.claude-3-sonnet-20240229-v1:0": 200000,
+    "eu.anthropic.claude-3-haiku-20240307-v1:0": 200000,
+    "eu.meta.llama3-2-3b-instruct-v1:0": 131000,
+    "eu.meta.llama3-2-1b-instruct-v1:0": 131000,
+    "apac.anthropic.claude-3-5-sonnet-20240620-v1:0": 200000,
+    "apac.anthropic.claude-3-5-sonnet-20241022-v2:0": 200000,
+    "apac.anthropic.claude-3-sonnet-20240229-v1:0": 200000,
+    "apac.anthropic.claude-3-haiku-20240307-v1:0": 200000,
+    "amazon.nova-pro-v1:0": 300000,
+    "amazon.nova-micro-v1:0": 128000,
+    "amazon.nova-lite-v1:0": 300000,
+    "anthropic.claude-3-5-sonnet-20240620-v1:0": 200000,
+    "anthropic.claude-3-5-haiku-20241022-v1:0": 200000,
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": 200000,
+    "anthropic.claude-3-7-sonnet-20250219-v1:0": 200000,
+    "anthropic.claude-3-sonnet-20240229-v1:0": 200000,
+    "anthropic.claude-3-opus-20240229-v1:0": 200000,
+    "anthropic.claude-3-haiku-20240307-v1:0": 200000,
+    "anthropic.claude-v2:1": 200000,
+    "anthropic.claude-v2": 100000,
+    "anthropic.claude-instant-v1": 100000,
+    "meta.llama3-1-405b-instruct-v1:0": 128000,
+    "meta.llama3-1-70b-instruct-v1:0": 128000,
+    "meta.llama3-1-8b-instruct-v1:0": 128000,
+    "meta.llama3-70b-instruct-v1:0": 8000,
+    "meta.llama3-8b-instruct-v1:0": 8000,
+    "amazon.titan-text-lite-v1": 4000,
+    "amazon.titan-text-express-v1": 8000,
+    "cohere.command-text-v14": 4000,
+    "ai21.j2-mid-v1": 8191,
+    "ai21.j2-ultra-v1": 8191,
+    "ai21.jamba-instruct-v1:0": 256000,
+    "mistral.mistral-7b-instruct-v0:2": 32000,
+    "mistral.mixtral-8x7b-instruct-v0:1": 32000,
+    # mistral
+    "mistral-tiny": 32768,
+    "mistral-small-latest": 32768,
+    "mistral-medium-latest": 32768,
+    "mistral-large-latest": 32768,
+    "mistral-large-2407": 32768,
+    "mistral-large-2402": 32768,
+    "mistral/mistral-tiny": 32768,
+    "mistral/mistral-small-latest": 32768,
+    "mistral/mistral-medium-latest": 32768,
+    "mistral/mistral-large-latest": 32768,
+    "mistral/mistral-large-2407": 32768,
+    "mistral/mistral-large-2402": 32768,
 }
 
 DEFAULT_CONTEXT_WINDOW_SIZE = 8192
-CONTEXT_WINDOW_USAGE_RATIO = 0.75
+CONTEXT_WINDOW_USAGE_RATIO = 0.85
 
 
 @contextmanager
@@ -102,16 +228,7 @@ def suppress_warnings():
             "ignore", message="open_text is deprecated*", category=DeprecationWarning
         )
 
-        # Redirect stdout and stderr
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = FilteredStream(old_stdout)
-        sys.stderr = FilteredStream(old_stderr)
-        try:
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+        yield
 
 
 class LLM:
@@ -133,9 +250,11 @@ class LLM:
         logprobs: Optional[int] = None,
         top_logprobs: Optional[int] = None,
         base_url: Optional[str] = None,
+        api_base: Optional[str] = None,
         api_version: Optional[str] = None,
         api_key: Optional[str] = None,
         callbacks: List[Any] = [],
+        stop_event: Any = None,
     ):
         self.model = model
         self.timeout = timeout
@@ -152,10 +271,12 @@ class LLM:
         self.logprobs = logprobs
         self.top_logprobs = top_logprobs
         self.base_url = base_url
+        self.api_base = api_base
         self.api_version = api_version
         self.api_key = api_key
         self.callbacks = callbacks
         self.context_window_size = 0
+        self.stop_event = stop_event
 
         litellm.drop_params = True
 
@@ -232,10 +353,11 @@ class LLM:
                     "seed": self.seed,
                     "logprobs": self.logprobs,
                     "top_logprobs": self.top_logprobs,
-                    "api_base": self.base_url,
+                    "api_base": self.api_base,
+                    "base_url": self.base_url,
                     "api_version": self.api_version,
                     "api_key": self.api_key,
-                    "stream": False,
+                    "stream": True,
                     "tools": tools,
                 }
 
@@ -243,25 +365,40 @@ class LLM:
                 params = {k: v for k, v in params.items() if v is not None}
 
                 # --- 2) Make the completion call
-                response = litellm.completion(**params)
-                response_message = cast(Choices, cast(ModelResponse, response).choices)[
-                    0
-                ].message
-                text_response = response_message.content or ""
-                tool_calls = getattr(response_message, "tool_calls", [])
+                text_response = ""
+                tool_calls = []
+                usage_info = None
+                start_time = time.time()
+                if self.stop_event is not None:
+                    self.stop_event.check_stop()
+
+                for chunk in litellm.completion(**params):
+                    if self.stop_event is not None:
+                        self.stop_event.check_stop()
+
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
+                    # accumulate streamed text
+                    if "content" in delta and delta["content"]:
+                        text_piece = delta["content"]
+                        text_response += text_piece
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        tool_calls.extend(delta["tool_calls"])
+                    # usage sometimes comes as separate event
+                    if "usage" in chunk and chunk["usage"]:
+                        usage_info = chunk["usage"]
+                end_time = time.time()
 
                 # --- 3) Handle callbacks with usage info
-                if callbacks and len(callbacks) > 0:
+                if callbacks and len(callbacks) > 0 and usage_info:
                     for callback in callbacks:
                         if hasattr(callback, "log_success_event"):
-                            usage_info = getattr(response, "usage", None)
-                            if usage_info:
-                                callback.log_success_event(
-                                    kwargs=params,
-                                    response_obj={"usage": usage_info},
-                                    start_time=0,
-                                    end_time=0,
-                                )
+                            callback.log_success_event(
+                                kwargs=params,
+                                response_obj={"usage": usage_info},
+                                start_time=start_time,
+                                end_time=end_time,
+                            )
 
                 # --- 4) If no tool calls, return the text response
                 if not tool_calls or not available_functions:

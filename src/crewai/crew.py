@@ -4,6 +4,7 @@ import re
 import uuid
 import warnings
 from concurrent.futures import Future
+from copy import copy as shallow_copy
 from hashlib import md5
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
@@ -23,11 +24,10 @@ from crewai.agent import Agent
 from crewai.agents.agent_builder.base_agent import BaseAgent
 from crewai.agents.cache import CacheHandler
 from crewai.crews.crew_output import CrewOutput
-from crewai.knowledge.knowledge import Knowledge
-from crewai.knowledge.source.base_knowledge_source import BaseKnowledgeSource
 from crewai.llm import LLM
 from crewai.memory.entity.entity_memory import EntityMemory
 from crewai.memory.long_term.long_term_memory import LongTermMemory
+from crewai.memory.long_term.local_long_term_memory import LocalLongTermMemory
 from crewai.memory.short_term.short_term_memory import ShortTermMemory
 from crewai.memory.user.user_memory import UserMemory
 from crewai.process import Process
@@ -84,6 +84,7 @@ class Crew(BaseModel):
         share_crew: Whether you want to share the complete crew information and execution with crewAI to make the library better, and allow us to train models.
         planning: Plan the crew execution and add the plan to the crew.
         chat_llm: The language model used for orchestrating chat interactions with the crew.
+
     """
 
     __hash__ = object.__hash__  # type: ignore
@@ -202,16 +203,13 @@ class Crew(BaseModel):
         default=[],
         description="List of execution logs for tasks",
     )
-    knowledge_sources: Optional[List[BaseKnowledgeSource]] = Field(
-        default=None,
-        description="Knowledge sources for the crew. Add knowledge sources to the knowledge object.",
-    )
     chat_llm: Optional[Any] = Field(
         default=None,
         description="LLM used to handle chatting with the crew.",
     )
-    _knowledge: Optional[Knowledge] = PrivateAttr(
+    manager_ask_human_input_callback: Optional[Any] = Field(
         default=None,
+        description="Callback to be executed for human input by manager agent",
     )
 
     @field_validator("id", mode="before")
@@ -257,9 +255,16 @@ class Crew(BaseModel):
     def create_crew_memory(self) -> "Crew":
         """Set private attributes."""
         if self.memory:
-            self._long_term_memory = (
-                self.long_term_memory if self.long_term_memory else LongTermMemory()
-            )
+            if hasattr(self, "memory_config") and self.memory_config is not None:
+                memory_provider = self.memory_config.get("provider")
+                if memory_provider == "local_mem0":
+                    self._long_term_memory = LocalLongTermMemory(
+                        crew=self, embedder_config=self.embedder
+                    )
+            else:
+                self._long_term_memory = (
+                    self.long_term_memory if self.long_term_memory else LongTermMemory()
+                )
             self._short_term_memory = (
                 self.short_term_memory
                 if self.short_term_memory
@@ -275,30 +280,15 @@ class Crew(BaseModel):
             )
             if hasattr(self, "memory_config") and self.memory_config is not None:
                 self._user_memory = (
-                    self.user_memory if self.user_memory else UserMemory(crew=self)
+                    self.user_memory
+                    if self.user_memory
+                    else UserMemory(
+                        crew=self,
+                        embedder_config=self.embedder,
+                    )
                 )
             else:
                 self._user_memory = None
-        return self
-
-    @model_validator(mode="after")
-    def create_crew_knowledge(self) -> "Crew":
-        """Create the knowledge for the crew."""
-        if self.knowledge_sources:
-            try:
-                if isinstance(self.knowledge_sources, list) and all(
-                    isinstance(k, BaseKnowledgeSource) for k in self.knowledge_sources
-                ):
-                    self._knowledge = Knowledge(
-                        sources=self.knowledge_sources,
-                        embedder_config=self.embedder,
-                        collection_name="crew",
-                    )
-
-            except Exception as e:
-                self._logger.log(
-                    "warning", f"Failed to init knowledge: {e}", color="yellow"
-                )
         return self
 
     @model_validator(mode="after")
@@ -492,21 +482,26 @@ class Crew(BaseModel):
         train_crew = self.copy()
         train_crew._setup_for_training(filename)
 
-        for n_iteration in range(n_iterations):
-            train_crew._train_iteration = n_iteration
-            train_crew.kickoff(inputs=inputs)
+        try:
+            for n_iteration in range(n_iterations):
+                train_crew._train_iteration = n_iteration
+                train_crew.kickoff(inputs=inputs)
 
-        training_data = CrewTrainingHandler(TRAINING_DATA_FILE).load()
+            training_data = CrewTrainingHandler(TRAINING_DATA_FILE).load()
 
-        for agent in train_crew.agents:
-            if training_data.get(str(agent.id)):
-                result = TaskEvaluator(agent).evaluate_training_data(
-                    training_data=training_data, agent_id=str(agent.id)
-                )
-
-                CrewTrainingHandler(filename).save_trained_data(
-                    agent_id=str(agent.role), trained_data=result.model_dump()
-                )
+            for agent in train_crew.agents:
+                if training_data.get(str(agent.id)):
+                    result = TaskEvaluator(agent).evaluate_training_data(
+                        training_data=training_data, agent_id=str(agent.id)
+                    )
+                    CrewTrainingHandler(filename).save_trained_data(
+                        agent_id=str(agent.role), trained_data=result.model_dump()
+                    )
+        except Exception as e:
+            self._logger.log("error", f"Training failed: {e}", color="red")
+            CrewTrainingHandler(TRAINING_DATA_FILE).clear()
+            CrewTrainingHandler(filename).clear()
+            raise
 
     def kickoff(
         self,
@@ -688,6 +683,7 @@ class Crew(BaseModel):
                 allow_delegation=True,
                 llm=self.manager_llm,
                 verbose=self.verbose,
+                ask_human_input_callback=self.manager_ask_human_input_callback,
             )
             self.manager_agent = manager
         manager.crew = self
@@ -886,12 +882,8 @@ class Crew(BaseModel):
         return tools
 
     def _get_context(self, task: Task, task_outputs: List[TaskOutput]):
-        context = (
-            aggregate_raw_outputs_from_tasks(task.context)
-            if task.context
-            else aggregate_raw_outputs_from_task_outputs(task_outputs)
-        )
-        return context
+        if task.context:
+            return aggregate_raw_outputs_from_tasks(task.context)
 
     def _process_task_result(self, task: Task, output: TaskOutput) -> None:
         role = task.agent.role if task.agent is not None else "None"
@@ -990,11 +982,6 @@ class Crew(BaseModel):
         result = self._execute_tasks(self.tasks, start_index, True)
         return result
 
-    def query_knowledge(self, query: List[str]) -> Union[List[Dict[str, Any]], None]:
-        if self._knowledge:
-            return self._knowledge.query(query)
-        return None
-
     def fetch_inputs(self) -> Set[str]:
         """
         Gathers placeholders (e.g., {something}) referenced in tasks or agents.
@@ -1043,6 +1030,7 @@ class Crew(BaseModel):
         task_mapping = {}
 
         cloned_tasks = []
+
         for task in self.tasks:
             cloned_task = task.copy(cloned_agents, task_mapping)
             cloned_tasks.append(cloned_task)
@@ -1062,7 +1050,11 @@ class Crew(BaseModel):
         copied_data.pop("agents", None)
         copied_data.pop("tasks", None)
 
-        copied_crew = Crew(**copied_data, agents=cloned_agents, tasks=cloned_tasks)
+        copied_crew = Crew(
+            **copied_data,
+            agents=cloned_agents,
+            tasks=cloned_tasks,
+        )
 
         return copied_crew
 
